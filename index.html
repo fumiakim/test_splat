@@ -22,6 +22,25 @@
                 margin: 0;
                 overflow: hidden;
             }
+
+            /*
+                Space backdrop. settings.json clears the viewer's canvas to transparent
+                (background.color [0,0,0,0]), so this gradient shows behind the splat.
+                The drifting light particles are drawn by space-fx.js.
+            */
+            html {
+                background: #01030b;
+            }
+            body {
+                background:
+                    radial-gradient(ellipse 75% 60% at 50% 45%, rgba(38, 78, 160, 0.42) 0%, rgba(20, 44, 110, 0.26) 40%, rgba(6, 14, 44, 0) 75%),
+                    radial-gradient(ellipse 55% 45% at 12% 88%, rgba(24, 70, 130, 0.22) 0%, rgba(24, 70, 130, 0) 70%),
+                    radial-gradient(ellipse 50% 40% at 90% 10%, rgba(40, 52, 130, 0.2) 0%, rgba(40, 52, 130, 0) 70%),
+                    linear-gradient(180deg, #050c26 0%, #08173d 45%, #040b24 78%, #01040f 100%);
+            }
+            body > .sse-viewer {
+                z-index: 1;
+            }
         </style>
 
         <!--
@@ -142,5 +161,8 @@
             // standalone document's container is the page itself
             createViewer({ container: document.body, settings, ...options });
         </script>
+
+        <!-- Space background particles (separate module: a failure here never stops the viewer) -->
+        <script type="module" src="./space-fx.js"></script>
     </body>
 </html>
