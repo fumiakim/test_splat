@@ -159,7 +159,10 @@
 
             // the viewer builds its own subtree (canvas, ui, icons) inside the container; the
             // standalone document's container is the page itself
-            createViewer({ container: document.body, settings, ...options });
+            // kept on window so flight.js can hand the camera from its animation to the user
+            createViewer({ container: document.body, settings, ...options }).then((viewer) => {
+                window.sseViewer = viewer;
+            });
         </script>
 
         <!-- Space background particles (separate module: a failure here never stops the viewer) -->

@@ -11,8 +11,15 @@
 //    モデル中心より手前か奥かで振り分け、境目はなめらかに重ね合わせる。
 //  - 焦点（モデル中心の距離）から外れた粒ほど大きく柔らかいボケ玉になる（被写界深度風）。
 //  - 明るい粒は芯が白く飛び、まわりに光が溢れる。モデルの奥には暖色の光の雲ときらめきの塊。
+//  - ふくらはぎのスラスター（CONFIG.thrusters）から斜め下へ白い炎を噴き出す（ノズルの光＋
+//    ノズルから先端まで一続きの帯。粒の集まりにしないので、近づいても丸い粒に分かれない）。
 //
 // ?noparticles を URL に付けると無効になる。
+//
+// 移動（flight.js）: キー操作で宇宙空間を移動する。モデルは中心に置いたまま、まわりの粒（星以外）を
+// 逆向きに流し、一定の大きさの箱で繰り返して（ラップして）どこまでも続く空間にしている。
+
+import { createFlight } from './flight.js';
 
 const CONFIG = {
     // 数
@@ -37,6 +44,18 @@ const CONFIG = {
     frontBokeh: 0.35, // モデルより手前のボケ玉の明るさ（小さいほどモデルが見やすい）
     frontGlow: 0.45, // モデルより手前の粒の光のにじみ（小さいほどモデルが見やすい）
     softness: 0.9, // 粒のエッジのぼかし（0 = くっきりした円、1 = 中心から外へなめらかに消える）
+    // ふくらはぎのスラスターから斜め下へ噴き出す白い炎
+    flame: 1.0, // 炎の明るさ（0 で消える）
+    flameLength: 1.0, // 炎の長さ（ワールド単位。ノズルの直径がおよそ 0.09）
+    flameAngle: 50, // 噴射の向き: 真後ろ（水平）から下へ何度傾けるか
+    flameSplay: 0.15, // 左右の炎を外側へ開く量
+    flameWidth: 1.0, // 炎の太さ（倍率）
+    nozzleSize: 0.09, // ノズルの直径（ワールド単位）
+    // ノズルの位置と面の向き（ワールド座標。ビューアでノズルをダブルクリックして拾った値）
+    thrusters: [
+        { pos: [0.2556, -0.569, -0.0941], normal: [-0.371, 0.222, -0.902] },
+        { pos: [-0.2266, -0.6471, -0.1895], normal: [0.292, 0.105, -0.951] }
+    ],
     // 動き
     timeScale: 1.0, // 全体の速さ
     speed: 1.0, // 粒が移動する速さ（倍率）。向きは粒ごとにランダムで、ゆっくり曲がりながら進む
@@ -46,6 +65,7 @@ const CONFIG = {
     clusterRadius: [1.6, 3.0],
     clearance: 1.25, // モデルのまわりで粒を出さない範囲（境界箱に対する倍率）
     starRadius: [22, 55],
+    wrapSize: 8, // 移動中に繰り返す空間の大きさ（モデルの半径 = 1）。粒の配置範囲より少し大きく
     // モデルの境界が取れなかったときの代わり（カメラ距離に対する比）
     fallbackRadiusRatio: 0.6,
     maxDpr: 2
@@ -72,6 +92,8 @@ const HAZE_PALETTE = [
     { c: [0.85, 0.28, 0.3], w: 0.2 }
 ];
 const HAZE_CORE = [1.0, 0.82, 0.55];
+// 炎の先の方の色（根元は白）
+const FLAME_TAIL = [0.72, 0.86, 1.0];
 
 // ---------------------------------------------------------------------------------------------
 // particles
@@ -90,6 +112,8 @@ const mix = (a, b, t) => a + (b - a) * t;
 const FIELD = 0; // light particle with depth of field
 const STAR = 1; // distant star, fixed pixel size
 const HAZE = 2; // large soft cloud of light, behind the model only
+const FLAME = 3; // glow at a thruster nozzle, in world coordinates
+const BEAM = 4; // thruster jet: one tapered strip from the nozzle to the tip, in world coordinates
 
 // per instance: pos(3) motion(4) phase(4) look(4) params(4) extra(4) = 23 floats
 const STRIDE = 23;
@@ -263,7 +287,43 @@ const buildParticles = () => {
             drift: { speed: 0, radius: 0 }
         });
     }
-    return { data: new Float32Array(out), count: out.length / STRIDE };
+    // thruster flames, in world coordinates (the nozzles were picked on the splat itself). Per
+    // nozzle a glow at the nozzle (FLAME) and two tapered strips along the jet (BEAM): a wide pale
+    // plume and a short white-hot core. A strip is one continuous shape, so the flame never
+    // breaks up into separate blobs however close the camera gets.
+    //   pos = nozzle, motion = (jet direction, length), phase = (point inside the calf, flicker),
+    //   look = (colour, intensity), params = (size or width at the nozzle, kind, width at the tip, -),
+    //   extra = (-, seed, -, -)
+    const flameStart = out.length / STRIDE;
+    const T = CONFIG.thrusters ?? [];
+    if (CONFIG.flame > 0 && T.length) {
+        const norm = (v) => {
+            const l = Math.hypot(...v) || 1;
+            return v.map((x) => x / l);
+        };
+        const up = [0, 1, 0];
+        // the legs' common backward direction, level; "right" is across the model
+        const back = norm([T.reduce((a, t) => a + t.normal[0], 0), 0, T.reduce((a, t) => a + t.normal[2], 0)]);
+        const right = norm([up[1] * back[2] - up[2] * back[1], up[2] * back[0] - up[0] * back[2], up[0] * back[1] - up[1] * back[0]]);
+        const mean = [0, 1, 2].map((i) => T.reduce((a, t) => a + t.pos[i], 0) / T.length);
+        const tilt = (CONFIG.flameAngle * Math.PI) / 180;
+        const w = CONFIG.nozzleSize * CONFIG.flameWidth;
+        for (const t of T) {
+            const side = Math.sign((t.pos[0] - mean[0]) * right[0] + (t.pos[2] - mean[2]) * right[2]);
+            const dir = norm([0, 1, 2].map((i) => back[i] * Math.cos(tilt) - up[i] * Math.sin(tilt) + right[i] * side * CONFIG.flameSplay));
+            const n = norm(t.normal);
+            const start = t.pos.map((v, i) => v + n[i] * 0.01);
+            const inside = t.pos.map((v, i) => v - back[i] * CONFIG.nozzleSize * 1.2);
+            const flicker = rnd() * TAU;
+            const emit = (kind, look, w0, w1, length) =>
+                out.push(...start, ...dir, length, ...inside, flicker, ...look, w0, kind, w1, 0, 0, rnd(), 0, 0);
+            emit(FLAME, [1, 1, 1, 1.2], CONFIG.nozzleSize * 3.2, 0, 0); // glow at the nozzle
+            emit(BEAM, [...FLAME_TAIL, 1.8], w * 1.5, w * 5.5, CONFIG.flameLength); // plume
+            emit(BEAM, [1, 1, 1, 2.2], w * 0.9, w * 1.7, CONFIG.flameLength * 0.5); // white-hot core
+        }
+    }
+
+    return { data: new Float32Array(out), count: out.length / STRIDE, flameStart };
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -299,6 +359,12 @@ uniform float uSoftness;
 uniform float uGlow;
 uniform float uHaze;
 uniform float uSpeed;
+uniform float uFlame;
+uniform float uFlameScale; // jet length with the thrust
+uniform vec3 uOffset;      // how far the space has moved past the model (model radii)
+uniform float uWrap;       // the space repeats every uWrap
+uniform mat3 uModelRot;    // the model's turn and lean while flying
+uniform vec3 uPivot;       // ... about its centre (world)
 
 out vec2 vUv;
 out vec3 vColor;
@@ -314,6 +380,7 @@ out vec2 vSeed;
 float hash1(float n) {
     return fract(sin(n) * 43758.5453123);
 }
+
 
 // Travel at \`speed\` in a random direction that slowly turns: a circle of \`radius\` through the
 // start point, on a plane picked from \`seed\`. Bounded, so nothing ever has to wrap around.
@@ -341,16 +408,30 @@ void main() {
     vSeed = vec2(aExtra.y * 37.0, aExtra.y * 53.0 + 7.0);
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
 
-    // each particle travels its own random way; a cluster also travels as one; plus a wobble
-    float tm = uTime * uSpeed;
-    vec3 p = aPos + drift(aExtra.y, aParams.w, aExtra.z, tm);
-    if (aExtra.w > 0.5) {
-        float g = aExtra.w * 0.1373 + 0.05;
-        p += drift(g, mix(0.05, 0.11, hash1(g * 7.13 + 5.0)), mix(0.8, 1.5, hash1(g * 3.31 + 6.0)), tm);
+    vec3 world;
+    float travelFade = 1.0;
+    if (aParams.y > 2.5) {
+        // thruster glow or jet: aPos is the nozzle itself (world), turned and leaned with the model
+        world = uPivot + uModelRot * (aPos - uPivot);
+    } else {
+        // each particle travels its own random way; a cluster also travels as one; plus a wobble
+        float tm = uTime * uSpeed;
+        vec3 p = aPos + drift(aExtra.y, aParams.w, aExtra.z, tm);
+        if (aExtra.w > 0.5) {
+            float g = aExtra.w * 0.1373 + 0.05;
+            p += drift(g, mix(0.05, 0.11, hash1(g * 7.13 + 5.0)), mix(0.8, 1.5, hash1(g * 3.31 + 6.0)), tm);
+        }
+        p += aMotion.x * sin(tm * aMotion.yzw + aPhase.xyz);
+        if (aParams.y < 0.5 || aParams.y > 1.5) {
+            // light and clouds stream past as the model flies; the space repeats every uWrap, and
+            // whatever is about to jump to the other side fades out first (stars stay put)
+            p -= uOffset;
+            p = mod(p + 0.5 * uWrap, uWrap) - 0.5 * uWrap;
+            vec3 ap = abs(p);
+            travelFade = 1.0 - smoothstep(0.4 * uWrap, 0.5 * uWrap, max(ap.x, max(ap.y, ap.z)));
+        }
+        world = uCenter + p * uScale;
     }
-    p += aMotion.x * sin(tm * aMotion.yzw + aPhase.xyz);
-
-    vec3 world = uCenter + p * uScale;
     vec4 v = uView * vec4(world, 1.0);
     float depth = -v.z;
     if (depth < 0.02) return;
@@ -359,9 +440,52 @@ void main() {
     float intensity = aLook.a * uGain;
     float sizePx;
     float blur = 0.0;
+    vec2 axis = vec2(1.0, 0.0); // quad orientation on screen (flames are stretched along their jet)
+    float stretch = 1.0;
     float pxPerUnit = uProj.y * 0.5 * uViewport.y / depth;
 
-    if (aParams.y > 1.5) {
+    bool beam = aParams.y > 3.5;
+    vec4 beamPos = vec4(2.0, 2.0, 2.0, 1.0);
+    if (aParams.y > 2.5) {
+        float flicker = 0.85 + 0.15 * sin(uTime * 37.0 + aPhase.w) * sin(uTime * 23.0 + aPhase.w * 1.7);
+        float refDepth = -(uView * vec4(uPivot + uModelRot * (aPhase.xyz - uPivot), 1.0)).z; // inside the calf
+        float myDepth = depth;
+        if (beam) {
+            // a strip from the nozzle to the tip of the jet, narrow at the nozzle, wide at the tip
+            float jetLen = aMotion.w * uFlameScale;
+            vec4 vt = uView * vec4(world + (uModelRot * aMotion.xyz) * jetLen, 1.0);
+            float tipDepth = -vt.z;
+            if (tipDepth < 0.02) return;
+            vec2 ps = vec2(uProj.x * v.x, uProj.y * v.y) / depth * uViewport * 0.5;
+            vec2 pt = vec2(uProj.x * vt.x, uProj.y * vt.y) / tipDepth * uViewport * 0.5;
+            float w0 = aParams.x * pxPerUnit;
+            float w1 = aParams.z * uProj.y * 0.5 * uViewport.y / tipDepth;
+            vec2 seg = pt - ps;
+            float segLen = length(seg);
+            vec2 along = segLen > 1e-3 ? seg / segLen : vec2(0.0, -1.0);
+            // seen end-on the strip would fold into a thin line: keep it at least about as long
+            // as it is wide, and dim it, so it reads as a soft glow instead
+            float full = jetLen * 0.5 * (pxPerUnit + uProj.y * 0.5 * uViewport.y / tipDepth);
+            float side = clamp(segLen / max(full, 1.0), 0.0, 1.0);
+            float halfLen = max(segLen, 0.7 * max(w0, w1)) * 0.5;
+            vec2 mid = (ps + pt) * 0.5;
+            float t = aCorner.x * 0.5 + 0.5;
+            vec2 px = mix(mid - along * halfLen, mid + along * halfLen, t)
+                + vec2(-along.y, along.x) * aCorner.y * mix(w0, w1, t) * 0.5;
+            beamPos = vec4(px / (uViewport * 0.5), 0.0, 1.0);
+            vUv = vec2(t, aCorner.y);
+            intensity = aLook.a * mix(0.4, 1.0, side);
+            myDepth = mix(depth, tipDepth, t);
+        } else {
+            // the glow at the nozzle itself
+            sizePx = max(aParams.x * pxPerUnit, 3.0 * uDpr);
+            intensity = aLook.a;
+        }
+        intensity *= uFlame * flicker;
+        // in front of the calf draws over the model, behind it is hidden by the model
+        float wFront = smoothstep(refDepth + 0.03, refDepth - 0.03, myDepth);
+        intensity *= uLayer > 0.5 ? wFront : 1.0 - wFront;
+    } else if (aParams.y > 1.5) {
         // cloud of light: behind the model only, so it never hazes the model itself
         if (uLayer > 0.5) return;
         sizePx = aParams.x * uScale * pxPerUnit;
@@ -412,13 +536,19 @@ void main() {
         // soft discs in front of the model are kept faint so they do not veil it
         if (uLayer > 0.5) intensity *= mix(1.0, uFrontBokeh, blur);
     }
-    if (intensity < 0.003) return;
+    intensity *= travelFade;
+    if (!beam && intensity < 0.003) return;
 
     vAlpha = intensity;
     vBlur = blur;
     vCover = uCover * blur;
+    if (beam) {
+        gl_Position = beamPos;
+        return;
+    }
     vec2 ndc = vec2(uProj.x * v.x, uProj.y * v.y) / depth;
-    gl_Position = vec4(ndc + aCorner * sizePx / uViewport, 0.0, 1.0);
+    vec2 offPx = (axis * aCorner.x * stretch + vec2(-axis.y, axis.x) * aCorner.y) * sizePx * 0.5;
+    gl_Position = vec4(ndc + offPx * 2.0 / uViewport, 0.0, 1.0);
 }`;
 
 const FS = `#version 300 es
@@ -438,6 +568,7 @@ uniform float uExposure;
 uniform float uHazeCover;
 uniform float uGlowCover;
 uniform float uTime;
+uniform float uLayer;
 out vec4 outColor;
 
 float hash(vec2 p) {
@@ -455,13 +586,32 @@ float noise(vec2 p) {
 
 void main() {
     float d = length(vUv);
-    if (d > 1.0) discard;
 
     // Light is summed, then pushed through an exposure curve: dim light keeps its colour and
     // strong light saturates towards white, so bright cores burn white inside an orange glow.
-    vec3 light;
-    float cover;
-    if (vKind > 1.5) {
+    vec3 light = vec3(0.0);
+    float cover = 0.0;
+    if (vKind > 3.5) {
+        // jet strip: u runs from the nozzle (0) to the tip (1), v across it (-1..1). Noise
+        // scrolling downstream makes it flicker and flow; the centre line burns whitest.
+        float u = vUv.x;
+        float v = vUv.y;
+        float acrossP = exp(-v * v * 3.0) * (1.0 - v * v);
+        float alongP = smoothstep(0.0, 0.06, u) * pow(max(1.0 - u, 0.0), 1.1);
+        vec2 q = vec2(u * 6.0 - uTime * 7.0, v * 1.6 + vSeed.x);
+        float n = 0.6 * noise(q) + 0.4 * noise(q * 2.1 + vec2(-uTime * 5.0, vSeed.y));
+        float L = vAlpha * acrossP * alongP * mix(0.5, 1.4, n);
+        light = mix(vColor, vec3(1.0), exp(-v * v * 8.0) * (1.0 - u)) * L;
+        cover = min(L, 0.9);
+    } else if (d > 1.0) {
+        discard;
+    } else if (vKind > 2.5) {
+        // nozzle glow: a soft round glow
+        float e = 1.0 - d * d;
+        float L = vAlpha * exp(-d * d * 2.6) * e * e;
+        light = vColor * L;
+        cover = min(L, 0.9);
+    } else if (vKind > 1.5) {
         // cloud: a broad soft glow, broken up by slowly drifting noise so it is not a circle
         vec2 q = vUv * 1.7 + vSeed + vec2(uTime * 0.008, -uTime * 0.005);
         float n = 0.65 * noise(q) + 0.35 * noise(q * 2.3 + 11.0);
@@ -484,8 +634,12 @@ void main() {
     }
     vec3 rgb = 1.0 - exp(-light * uExposure);
     // premultiplied: the light is added, and part of it also covers what is behind, so warm
-    // light reads as warm over the blue instead of turning grey
-    outColor = vec4(rgb, clamp(cover, 0.0, 1.0));
+    // light reads as warm over the blue instead of turning grey. The front layer sits inside the
+    // viewer's own compositing group, where pure light (alpha 0) does not show, so there every
+    // pixel covers as much as it shines (a screen-like blend over the model)
+    float a = clamp(cover, 0.0, 1.0);
+    if (uLayer > 0.5) a = max(a, max(rgb.r, max(rgb.g, rgb.b)));
+    outColor = vec4(rgb, a);
 }`;
 
 // ---------------------------------------------------------------------------------------------
@@ -523,36 +677,43 @@ class Layer {
         for (const name of [
             'uView', 'uProj', 'uCenter', 'uScale', 'uHalfExt', 'uTime', 'uViewport', 'uDpr',
             'uFocus', 'uBand', 'uAperture', 'uMaxSize', 'uLayer', 'uGain', 'uFrontBokeh', 'uCover', 'uSoftness',
-            'uGlow', 'uHaze', 'uExposure', 'uHazeCover', 'uGlowCover', 'uSpeed'
+            'uGlow', 'uHaze', 'uExposure', 'uHazeCover', 'uGlowCover', 'uSpeed', 'uFlame',
+            'uFlameScale', 'uOffset', 'uWrap', 'uModelRot', 'uPivot'
         ]) {
             this.u[name] = gl.getUniformLocation(prog, name);
         }
 
-        this.vao = gl.createVertexArray();
-        gl.bindVertexArray(this.vao);
         const quad = gl.createBuffer();
         gl.bindBuffer(gl.ARRAY_BUFFER, quad);
         gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
-        gl.enableVertexAttribArray(0);
-        gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-
         const inst = gl.createBuffer();
         gl.bindBuffer(gl.ARRAY_BUFFER, inst);
         gl.bufferData(gl.ARRAY_BUFFER, particles.data, gl.STATIC_DRAW);
-        const sizes = [3, 4, 4, 4, 4, 4];
-        let offset = 0;
-        sizes.forEach((n, i) => {
-            gl.enableVertexAttribArray(i + 1);
-            gl.vertexAttribPointer(i + 1, n, gl.FLOAT, false, STRIDE * 4, offset * 4);
-            gl.vertexAttribDivisor(i + 1, 1);
-            offset += n;
-        });
-        gl.bindVertexArray(null);
-        this.count = particles.count;
+        // one vertex array per instance range over the same buffer (WebGL2 has no base instance)
+        const makeVao = (firstInstance) => {
+            const vao = gl.createVertexArray();
+            gl.bindVertexArray(vao);
+            gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+            gl.enableVertexAttribArray(0);
+            gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+            gl.bindBuffer(gl.ARRAY_BUFFER, inst);
+            let offset = firstInstance * STRIDE;
+            [3, 4, 4, 4, 4, 4].forEach((n, i) => {
+                gl.enableVertexAttribArray(i + 1);
+                gl.vertexAttribPointer(i + 1, n, gl.FLOAT, false, STRIDE * 4, offset * 4);
+                gl.vertexAttribDivisor(i + 1, 1);
+                offset += n;
+            });
+            gl.bindVertexArray(null);
+            return vao;
+        };
+        this.vao = makeVao(0);
+        this.count = particles.flameStart;
+        this.flameVao = makeVao(particles.flameStart);
+        this.flameCount = particles.count - particles.flameStart;
 
         gl.disable(gl.DEPTH_TEST);
         gl.enable(gl.BLEND);
-        gl.blendFunc(gl.ONE, gl.ONE); // additive light
         gl.clearColor(0, 0, 0, 0);
     }
 
@@ -593,12 +754,27 @@ class Layer {
         gl.uniform1f(u.uHaze, CONFIG.haze * frame.fade);
         gl.uniform1f(u.uExposure, CONFIG.exposure);
         gl.uniform1f(u.uSpeed, CONFIG.speed);
+        gl.uniform1f(u.uFlame, CONFIG.flame * frame.modelFade * frame.thrust);
+        gl.uniform1f(u.uFlameScale, frame.flameScale);
+        gl.uniform3fv(u.uOffset, frame.offset);
+        gl.uniform1f(u.uWrap, CONFIG.wrapSize);
+        gl.uniformMatrix3fv(u.uModelRot, false, frame.modelRot);
+        gl.uniform3fv(u.uPivot, frame.pivot);
         gl.uniform1f(u.uHazeCover, CONFIG.hazeCover);
         gl.uniform1f(u.uGlowCover, CONFIG.glowCover * (this.layerIndex ? 0.5 : 1));
         gl.uniform1f(u.uLayer, this.layerIndex);
         gl.uniform1f(u.uGain, CONFIG.gain * frame.fade);
+        // the light particles add up
+        gl.blendFunc(gl.ONE, gl.ONE);
         gl.bindVertexArray(this.vao);
         gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.count);
+        // the flames go over them: a particle behind a flame is covered by it, rather than having
+        // the flame's light added on top, which turned the round particles into white discs
+        if (this.flameCount > 0) {
+            gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+            gl.bindVertexArray(this.flameVao);
+            gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.flameCount);
+        }
         gl.bindVertexArray(null);
     }
 }
@@ -703,6 +879,7 @@ const start = async () => {
     frontCanvas.className = 'space-fx space-fx-front';
 
     const particles = buildParticles();
+    const flight = createFlight({ wrap: CONFIG.wrapSize });
     let back;
     let front = null;
     try {
@@ -752,6 +929,12 @@ const start = async () => {
         time: 0,
         dpr: 1,
         fade: 0,
+        modelFade: 0, // flames belong to the model: they wait for it to load
+        thrust: 0,
+        flameScale: 1,
+        offset: new Float32Array(3),
+        modelRot: new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]),
+        pivot: new Float32Array(3),
         hidden: false,
         projX: (w, h) => {
             if (proj) return proj[0];
@@ -799,6 +982,7 @@ const start = async () => {
         // bounds
         if (app && !targetBounds) targetBounds = readBounds(app);
         if (targetBounds) {
+            frame.modelFade = Math.min(1, frame.modelFade + dt / 1.2);
             const k = 1 - Math.exp(-dt * 2.5);
             for (let i = 0; i < 3; i++) {
                 bounds.center[i] += (targetBounds.center[i] - bounds.center[i]) * k;
@@ -814,6 +998,16 @@ const start = async () => {
         frame.band = Math.max(0.05, Math.min(...bounds.halfExt) * 0.5);
         const [cx, cy, cz] = bounds.center;
         frame.focus = Math.max(0.05, -(view[2] * cx + view[6] * cy + view[10] * cz + view[14]));
+
+        // flight: the camera looks down its -Z; move, then turn and lean the model to match
+        const fs = flight.update(dt, [-camWorld[8], -camWorld[9], -camWorld[10]]);
+        const pivot = targetBounds?.center ?? bounds.center;
+        if (app && targetBounds) flight.applyToModel(app, pivot);
+        frame.offset.set(fs.offset);
+        frame.modelRot.set(fs.rotMat);
+        frame.pivot.set(pivot);
+        frame.thrust = fs.thrust;
+        frame.flameScale = (0.6 + 0.4 * fs.thrust) * (1 + 0.35 * fs.sprint);
 
         back.draw(frame);
         if (front) front.draw(frame);
