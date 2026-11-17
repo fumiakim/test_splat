@@ -39,6 +39,7 @@ const CONFIG = {
     cover: 0.6, // ボケ玉が背景を覆う割合（0 = 純粋な加算光、1 = 不透明な円）。上げるほど色が濃く見える
     glowCover: 0.3, // 光のにじみが背景を覆う割合
     aperture: 0.022, // ボケの強さ（大きいほど手前/奥の粒が大きくボケる）
+    particleSize: 0.5, // 光の粒（ボケ玉）の見た目の大きさの倍率（1 = 元の大きさ、0.5 = 半分）
     maxSizeRatio: 0.2, // ボケ玉の最大直径（画面の高さに対する比）
     frontMaxSizeRatio: 0.12, // モデルより手前のボケ玉の最大直径
     frontBokeh: 0.35, // モデルより手前のボケ玉の明るさ（小さいほどモデルが見やすい）
@@ -55,6 +56,11 @@ const CONFIG = {
     thrusters: [
         { pos: [0.2556, -0.569, -0.0941], normal: [-0.371, 0.222, -0.902] },
         { pos: [-0.2266, -0.6471, -0.1895], normal: [0.292, 0.105, -0.951] }
+    ],
+    // 炎を隠す物（ワールド座標、静止時の姿勢）。ここにある物がカメラと炎の間に入ると、炎はその後ろに隠れる。
+    // 左腕の盾をスプラット上でダブルクリックして測った箱（中心、長さ方向、面の向き、半分の大きさ[長さ, 幅, 厚み]）
+    occluders: [
+        { center: [0.875, 0.275, -0.03], length: [0.153, -0.988, 0.035], normal: [0.971, 0.157, 0.181], half: [0.87, 0.33, 0.1] }
     ],
     // 動き
     timeScale: 1.0, // 全体の速さ
@@ -94,6 +100,20 @@ const HAZE_PALETTE = [
 const HAZE_CORE = [1.0, 0.82, 0.55];
 // 炎の先の方の色（根元は白）
 const FLAME_TAIL = [0.72, 0.86, 1.0];
+
+// occluder boxes with orthonormal axes: u along the length, w the face normal, v across
+const OCCLUDERS = (CONFIG.occluders ?? []).map((o) => {
+    const norm = (a) => {
+        const l = Math.hypot(...a) || 1;
+        return a.map((x) => x / l);
+    };
+    const u = norm(o.length);
+    const nn = norm(o.normal);
+    const d = nn[0] * u[0] + nn[1] * u[1] + nn[2] * u[2];
+    const w = norm([nn[0] - d * u[0], nn[1] - d * u[1], nn[2] - d * u[2]]);
+    const v = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+    return { center: o.center, u, v, w, half: o.half };
+});
 
 // ---------------------------------------------------------------------------------------------
 // particles
@@ -351,6 +371,7 @@ uniform float uFocus;      // view depth of the model centre
 uniform float uBand;       // front/back blend band (world)
 uniform float uAperture;
 uniform float uMaxSize;    // device px
+uniform float uParticleSize; // light particles drawn at this fraction of their size
 uniform float uLayer;      // 0 back, 1 front
 uniform float uGain;
 uniform float uFrontBokeh;
@@ -376,6 +397,8 @@ out float vSpan;           // quad size / particle size (> 1 leaves room for the
 out float vGlow;
 flat out float vKind;
 out vec2 vSeed;
+out vec3 vWorld;           // flames: world position, for the per-pixel occlusion test
+out float vFront;          // flames: 1 in front of the calf, 0 behind it
 
 float hash1(float n) {
     return fract(sin(n) * 43758.5453123);
@@ -406,6 +429,8 @@ void main() {
     vGlow = 0.0;
     vKind = aParams.y;
     vSeed = vec2(aExtra.y * 37.0, aExtra.y * 53.0 + 7.0);
+    vWorld = vec3(0.0);
+    vFront = 0.0;
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
 
     vec3 world;
@@ -425,10 +450,14 @@ void main() {
         if (aParams.y < 0.5 || aParams.y > 1.5) {
             // light and clouds stream past as the model flies; the space repeats every uWrap, and
             // whatever is about to jump to the other side fades out first (stars stay put)
+            // each particle (a cluster as a whole) repeats at its own interval, so the space
+            // never comes round again in the same pattern
+            float wseed = aExtra.w > 0.5 ? hash1(aExtra.w * 0.618 + 0.3) : fract(aExtra.y * 7.31 + 0.17);
+            float wrapSize = uWrap * mix(0.9, 1.3, wseed);
             p -= uOffset;
-            p = mod(p + 0.5 * uWrap, uWrap) - 0.5 * uWrap;
+            p = mod(p + 0.5 * wrapSize, wrapSize) - 0.5 * wrapSize;
             vec3 ap = abs(p);
-            travelFade = 1.0 - smoothstep(0.4 * uWrap, 0.5 * uWrap, max(ap.x, max(ap.y, ap.z)));
+            travelFade = 1.0 - smoothstep(0.4 * wrapSize, 0.5 * wrapSize, max(ap.x, max(ap.y, ap.z)));
         }
         world = uCenter + p * uScale;
     }
@@ -453,7 +482,8 @@ void main() {
         if (beam) {
             // a strip from the nozzle to the tip of the jet, narrow at the nozzle, wide at the tip
             float jetLen = aMotion.w * uFlameScale;
-            vec4 vt = uView * vec4(world + (uModelRot * aMotion.xyz) * jetLen, 1.0);
+            vec3 tipW = world + (uModelRot * aMotion.xyz) * jetLen;
+            vec4 vt = uView * vec4(tipW, 1.0);
             float tipDepth = -vt.z;
             if (tipDepth < 0.02) return;
             vec2 ps = vec2(uProj.x * v.x, uProj.y * v.y) / depth * uViewport * 0.5;
@@ -476,15 +506,17 @@ void main() {
             vUv = vec2(t, aCorner.y);
             intensity = aLook.a * mix(0.4, 1.0, side);
             myDepth = mix(depth, tipDepth, t);
+            vWorld = mix(world, tipW, t);
         } else {
             // the glow at the nozzle itself
             sizePx = max(aParams.x * pxPerUnit, 3.0 * uDpr);
             intensity = aLook.a;
+            vWorld = world;
         }
         intensity *= uFlame * flicker;
-        // in front of the calf draws over the model, behind it is hidden by the model
-        float wFront = smoothstep(refDepth + 0.03, refDepth - 0.03, myDepth);
-        intensity *= uLayer > 0.5 ? wFront : 1.0 - wFront;
+        // in front of the calf draws over the model, behind it is hidden by the model; the layer is
+        // chosen per pixel in the fragment shader, which also checks the shield
+        vFront = smoothstep(refDepth + 0.03, refDepth - 0.03, myDepth);
     } else if (aParams.y > 1.5) {
         // cloud of light: behind the model only, so it never hazes the model itself
         if (uLayer > 0.5) return;
@@ -513,6 +545,7 @@ void main() {
             intensity *= smoothstep(0.12 * uScale, 0.45 * uScale, depth);
             intensity *= 1.0 - smoothstep(uMaxSize * 0.55, uMaxSize, base);
             base = min(base, uMaxSize);
+            base = max(base * uParticleSize, 1.2 * uDpr);
 
             // light spilling around it: wide for a sharp point, a thin aura for a soft disc
             float glow = aExtra.x * uGlow;
@@ -563,6 +596,15 @@ in float vSpan;
 in float vGlow;
 flat in float vKind;
 in vec2 vSeed;
+in vec3 vWorld;
+in float vFront;
+uniform vec3 uCamPos;
+uniform int uOccN;
+uniform vec3 uOccC[4];
+uniform vec3 uOccU[4];
+uniform vec3 uOccV[4];
+uniform vec3 uOccW[4];
+uniform vec3 uOccH[4];
 uniform float uSoftness;
 uniform float uExposure;
 uniform float uHazeCover;
@@ -576,6 +618,33 @@ float hash(vec2 p) {
     p += dot(p, p + 45.32);
     return fract(p.x * p.y);
 }
+// 1 when one of the occluder boxes (the shield) lies between the camera and point b
+float occluded(vec3 a, vec3 b) {
+    vec3 dir = b - a;
+    for (int i = 0; i < 4; i++) {
+        if (i >= uOccN) break;
+        vec3 o = a - uOccC[i];
+        vec3 lo = vec3(dot(o, uOccU[i]), dot(o, uOccV[i]), dot(o, uOccW[i]));
+        vec3 ld = vec3(dot(dir, uOccU[i]), dot(dir, uOccV[i]), dot(dir, uOccW[i]));
+        vec3 inv = 1.0 / mix(vec3(1e-6), ld, step(1e-6, abs(ld)));
+        vec3 t0 = (-uOccH[i] - lo) * inv;
+        vec3 t1 = (uOccH[i] - lo) * inv;
+        vec3 tmin = min(t0, t1);
+        vec3 tmax = max(t0, t1);
+        float tn = max(max(tmin.x, tmin.y), tmin.z);
+        float tf = min(min(tmax.x, tmax.y), tmax.z);
+        if (tn <= tf && tf > 0.0 && tn < 0.995) return 1.0;
+    }
+    return 0.0;
+}
+
+// how much of a flame pixel this layer draws: in front of the calf and not behind the shield
+// goes on the front layer (over the model); the rest goes behind the model, which hides it
+float flameLayer() {
+    float wf = vFront * (1.0 - occluded(uCamPos, vWorld));
+    return uLayer > 0.5 ? wf : 1.0 - wf;
+}
+
 float noise(vec2 p) {
     vec2 i = floor(p);
     vec2 f = fract(p);
@@ -600,7 +669,7 @@ void main() {
         float alongP = smoothstep(0.0, 0.06, u) * pow(max(1.0 - u, 0.0), 1.1);
         vec2 q = vec2(u * 6.0 - uTime * 7.0, v * 1.6 + vSeed.x);
         float n = 0.6 * noise(q) + 0.4 * noise(q * 2.1 + vec2(-uTime * 5.0, vSeed.y));
-        float L = vAlpha * acrossP * alongP * mix(0.5, 1.4, n);
+        float L = vAlpha * acrossP * alongP * mix(0.5, 1.4, n) * flameLayer();
         light = mix(vColor, vec3(1.0), exp(-v * v * 8.0) * (1.0 - u)) * L;
         cover = min(L, 0.9);
     } else if (d > 1.0) {
@@ -608,7 +677,7 @@ void main() {
     } else if (vKind > 2.5) {
         // nozzle glow: a soft round glow
         float e = 1.0 - d * d;
-        float L = vAlpha * exp(-d * d * 2.6) * e * e;
+        float L = vAlpha * exp(-d * d * 2.6) * e * e * flameLayer();
         light = vColor * L;
         cover = min(L, 0.9);
     } else if (vKind > 1.5) {
@@ -676,9 +745,10 @@ class Layer {
         this.u = {};
         for (const name of [
             'uView', 'uProj', 'uCenter', 'uScale', 'uHalfExt', 'uTime', 'uViewport', 'uDpr',
-            'uFocus', 'uBand', 'uAperture', 'uMaxSize', 'uLayer', 'uGain', 'uFrontBokeh', 'uCover', 'uSoftness',
+            'uFocus', 'uBand', 'uAperture', 'uMaxSize', 'uParticleSize', 'uLayer', 'uGain', 'uFrontBokeh', 'uCover', 'uSoftness',
             'uGlow', 'uHaze', 'uExposure', 'uHazeCover', 'uGlowCover', 'uSpeed', 'uFlame',
-            'uFlameScale', 'uOffset', 'uWrap', 'uModelRot', 'uPivot'
+            'uFlameScale', 'uOffset', 'uWrap', 'uModelRot', 'uPivot',
+            'uCamPos', 'uOccN', 'uOccC', 'uOccU', 'uOccV', 'uOccW', 'uOccH'
         ]) {
             this.u[name] = gl.getUniformLocation(prog, name);
         }
@@ -747,6 +817,7 @@ class Layer {
         gl.uniform1f(u.uBand, frame.band);
         gl.uniform1f(u.uAperture, CONFIG.aperture);
         gl.uniform1f(u.uMaxSize, (this.layerIndex ? CONFIG.frontMaxSizeRatio : CONFIG.maxSizeRatio) * h);
+        gl.uniform1f(u.uParticleSize, CONFIG.particleSize);
         gl.uniform1f(u.uFrontBokeh, CONFIG.frontBokeh);
         gl.uniform1f(u.uCover, CONFIG.cover);
         gl.uniform1f(u.uSoftness, CONFIG.softness);
@@ -760,6 +831,13 @@ class Layer {
         gl.uniform1f(u.uWrap, CONFIG.wrapSize);
         gl.uniformMatrix3fv(u.uModelRot, false, frame.modelRot);
         gl.uniform3fv(u.uPivot, frame.pivot);
+        gl.uniform3fv(u.uCamPos, frame.camPos);
+        gl.uniform1i(u.uOccN, frame.occ.n);
+        gl.uniform3fv(u.uOccC, frame.occ.c);
+        gl.uniform3fv(u.uOccU, frame.occ.u);
+        gl.uniform3fv(u.uOccV, frame.occ.v);
+        gl.uniform3fv(u.uOccW, frame.occ.w);
+        gl.uniform3fv(u.uOccH, frame.occ.h);
         gl.uniform1f(u.uHazeCover, CONFIG.hazeCover);
         gl.uniform1f(u.uGlowCover, CONFIG.glowCover * (this.layerIndex ? 0.5 : 1));
         gl.uniform1f(u.uLayer, this.layerIndex);
@@ -879,7 +957,7 @@ const start = async () => {
     frontCanvas.className = 'space-fx space-fx-front';
 
     const particles = buildParticles();
-    const flight = createFlight({ wrap: CONFIG.wrapSize });
+    const flight = createFlight();
     let back;
     let front = null;
     try {
@@ -935,6 +1013,8 @@ const start = async () => {
         offset: new Float32Array(3),
         modelRot: new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]),
         pivot: new Float32Array(3),
+        camPos: new Float32Array(3),
+        occ: { n: 0, c: new Float32Array(12), u: new Float32Array(12), v: new Float32Array(12), w: new Float32Array(12), h: new Float32Array(12) },
         hidden: false,
         projX: (w, h) => {
             if (proj) return proj[0];
@@ -1007,6 +1087,21 @@ const start = async () => {
         frame.modelRot.set(fs.rotMat);
         frame.pivot.set(pivot);
         frame.thrust = fs.thrust;
+        frame.camPos.set([camWorld[12], camWorld[13], camWorld[14]]);
+        // occluders turn and lean with the model, about its centre
+        const occ = frame.occ;
+        occ.n = Math.min(4, OCCLUDERS.length);
+        const R = fs.rotMat;
+        const rot = (x, y, z) => [R[0] * x + R[3] * y + R[6] * z, R[1] * x + R[4] * y + R[7] * z, R[2] * x + R[5] * y + R[8] * z];
+        for (let i = 0; i < occ.n; i++) {
+            const b = OCCLUDERS[i];
+            const c = rot(b.center[0] - pivot[0], b.center[1] - pivot[1], b.center[2] - pivot[2]);
+            occ.c.set([c[0] + pivot[0], c[1] + pivot[1], c[2] + pivot[2]], i * 3);
+            occ.u.set(rot(...b.u), i * 3);
+            occ.v.set(rot(...b.v), i * 3);
+            occ.w.set(rot(...b.w), i * 3);
+            occ.h.set(b.half, i * 3);
+        }
         frame.flameScale = (0.6 + 0.4 * fs.thrust) * (1 + 0.35 * fs.sprint);
 
         back.draw(frame);

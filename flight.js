@@ -12,7 +12,7 @@
 // ふくらはぎのスラスターの炎は、推力（キー入力）に合わせて出る。
 
 export const FLIGHT = {
-    speed: 1.6, // 移動の速さ（モデルの半径 / 秒）
+    speed: 3.2, // 移動の速さ（モデルの半径 / 秒）
     sprint: 2.5, // 加速時の倍率
     accel: 2.5, // 速度の追従の速さ（小さいほど慣性が強く、宇宙らしく流れる）
     lean: 25, // 移動中の前傾（度）
@@ -50,7 +50,7 @@ const qMat3 = ([x, y, z, w], out) => {
 };
 const wrapAngle = (a) => Math.atan2(Math.sin(a), Math.cos(a));
 
-export const createFlight = ({ wrap }) => {
+export const createFlight = () => {
     const pressed = new Set();
     let sprintLatched = false; // from a W double tap, until W is released
     let lastWDown = 0;
@@ -96,7 +96,7 @@ export const createFlight = ({ wrap }) => {
     const hint = createHint();
 
     const state = {
-        offset: [0, 0, 0], // how far the space has moved past the model (model radii, wrapped)
+        offset: [0, 0, 0], // how far the space has moved past the model (model radii)
         vel: [0, 0, 0],
         yaw: 0,
         lean: 0,
@@ -140,11 +140,8 @@ export const createFlight = ({ wrap }) => {
         state.vel[0] += (ix * top - state.vel[0]) * a;
         state.vel[1] += (iy * top - state.vel[1]) * a;
         state.vel[2] += (iz * top - state.vel[2]) * a;
-        for (let i = 0; i < 3; i++) {
-            state.offset[i] += state.vel[i] * dt;
-            // the space repeats every `wrap`, so the offset can stay small
-            state.offset[i] -= Math.floor(state.offset[i] / wrap + 0.5) * wrap;
-        }
+        // not wrapped here: every particle repeats at its own interval in the shader
+        for (let i = 0; i < 3; i++) state.offset[i] += state.vel[i] * dt;
         state.thrust += (input - state.thrust) * (1 - Math.exp(-dt * 8));
 
         // face where it is going along the ground, lean into it, stand up again when stopping
